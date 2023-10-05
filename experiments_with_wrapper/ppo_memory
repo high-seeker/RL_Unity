@@ -1,0 +1,126 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from mlagents_envs.environment import UnityEnvironment
+from mlagents_envs.envs.unity_gym_env import UnityToGymWrapper
+
+class Memory:
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
+
+    def add(self, state, action, log_prob, reward, done, value):
+        self.states.append(state)
+        self.actions.append(action)
+        self.log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+
+    def clear(self):
+        self.states.clear()
+        self.actions.clear()
+        self.log_probs.clear()
+        self.rewards.clear()
+        self.dones.clear()
+        self.values.clear()
+
+# Define the policy and value network
+class ActorCriticNetwork(nn.Module):
+    def __init__(self, input_dim, n_actions):
+        super(ActorCriticNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.actor = nn.Linear(128, n_actions)
+        self.critic = nn.Linear(128, 1)
+
+    def forward(self, state):
+        x = torch.relu(self.fc1(state))
+        x = torch.relu(self.fc2(x))
+        action_probs = torch.softmax(self.actor(x), dim=1)
+        value = self.critic(x)
+        return action_probs, value
+
+# Compute the clipped policy objective
+def compute_loss(new_probs, old_probs, actions, advantages, clip_epsilon=0.2):
+    ratio = (new_probs / old_probs)
+    clipped_ratio = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
+    policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+    return policy_loss
+
+def compute_advantages(values, rewards, dones, gamma=0.99, lamda=0.95):
+    advantages = torch.zeros_like(rewards)
+    last_advantage = 0
+    last_value = values[-1]
+
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * last_value * (1 - dones[t]) - values[t]
+        last_advantage = delta + gamma * lamda * (1 - dones[t]) * last_advantage
+        advantages[t] = last_advantage
+        last_value = values[t]
+    
+    return advantages
+
+def ppo(env, policy, optimizer, n_epochs=2000, n_steps=2048, gamma=0.99, clip_epsilon=0.2):
+    state = env.reset()
+    memory = Memory()
+    
+    for epoch in range(n_epochs):
+        for _ in range(n_steps):
+            state = torch.tensor([state]).float()
+            action_probs, value = policy(state)
+            action = torch.multinomial(action_probs, 1).item()
+            next_state, reward, done, _ = env.step(action)
+
+            log_prob = torch.log(action_probs[0][action])
+            memory.add(state, action, log_prob, reward, done, value.item())
+
+            state = next_state
+            if done:
+                state = env.reset()
+
+        states = torch.tensor(memory.states).float()
+        log_probs = torch.tensor(memory.log_probs)
+        values = torch.tensor(memory.values)
+        rewards = torch.tensor(memory.rewards)
+        dones = torch.tensor(memory.dones)
+        advantages = compute_advantages(values, rewards, dones, gamma)
+
+        # Optimization loop
+        for _ in range(10):
+            new_action_probs, new_values = policy(states)
+            new_action_probs = new_action_probs.gather(1, torch.tensor(memory.actions).unsqueeze(-1)).squeeze(-1)
+            value_loss = ((rewards + gamma * values[1:] - new_values[:-1]) ** 2).mean()
+            policy_loss = compute_loss(new_action_probs, log_probs.detach(), memory.actions, advantages.detach(), clip_epsilon)
+
+            optimizer.zero_grad()
+            (policy_loss + value_loss).backward()
+            optimizer.step()
+
+        print(f"Epoch: {epoch + 1}/{n_epochs}, Policy Loss: {policy_loss.item()}, Value Loss: {value_loss.item()}")
+        memory.clear()
+
+if __name__ == "__main__":
+
+    # Initialize the Unity environment
+    unity_env = UnityEnvironment(file_name="./push-block")
+    gym_env = UnityToGymWrapper(unity_env, allow_multiple_obs=True)
+
+    n_inputs = gym_env.observation_space.shape[0]
+    n_outputs = gym_env.action_space.n
+
+    policy = ActorCriticNetwork(n_inputs, n_outputs)
+    optimizer = optim.Adam(policy.parameters(), lr=0.001)
+
+    ppo(gym_env, policy, optimizer)
+
+    # Close the environments
+    gym_env.close()
+    unity_env.close()
+
+
